@@ -122,19 +122,40 @@ fn ts_type_declaration<'a>(i: &'a str) -> ParseResult<Node<'a>> {
 fn find_ts_declaration_end(s: &str) -> Option<usize> {
     let mut depth = 0;
     let mut chars = s.char_indices().peekable();
+    let mut found_first_brace = false;
     
     while let Some((idx, ch)) = chars.next() {
         match ch {
-            '{' => depth += 1,
+            '{' => {
+                depth += 1;
+                found_first_brace = true;
+            }
             '}' => {
                 depth -= 1;
-                if depth == 0 {
-                    // 找到匹配的 },返回其后的位置
-                    if let Some((next_idx, _)) = chars.peek() {
-                        return Some(*next_idx);
-                    } else {
-                        return Some(s.len());
+                if depth == 0 && found_first_brace {
+                    // 对于 type/interface 等,找到第一个 {} 后继续找 ;
+                    // 继续扫描直到遇到 ;,同时跟踪嵌套的 {}
+                    let mut inner_depth = 0;
+                    while let Some((next_idx, next_ch)) = chars.next() {
+                        match next_ch {
+                            '{' => inner_depth += 1,
+                            '}' => {
+                                if inner_depth == 0 {
+                                    // 不应该发生,但安全起见
+                                    return Some(next_idx + 1);
+                                }
+                                inner_depth -= 1;
+                            }
+                            ';' => {
+                                if inner_depth == 0 {
+                                    return Some(next_idx + 1);
+                                }
+                            }
+                            _ => {}
+                        }
                     }
+                    // 没找到 ;,返回末尾
+                    return Some(s.len());
                 }
             }
             ';' => {
@@ -292,9 +313,41 @@ fn yield2<'a>(i: &'a str) -> ParseResult<Node<'a>> {
 
 fn mutation<'a>(i: &'a str) -> ParseResult<Node<'a>> {
     let ops = &[
-        "=", "+=", "-=", "**=", "*=", "/=", "%=", "<<=", ">>>=", ">>=", "&=", "^=", "|=", ":",
+        "=", "+=", "-=", "**=", "*=", "/=", "%=", "<<=", ">>>=", ">>=", "&=", "^=", "|=",
     ];
-    map(infix(ternary, one_of(ops)), makechain2)(i)
+    
+    // 先解析左侧表达式
+    let (i, left) = ternary(i)?;
+    
+    // 检查并跳过类型注解
+    let (mut i, mut result) = if let Ok((i_after_colon, _)) = ws(tag(":"))(i) {
+        // 有类型注解,跳过类型名
+        if let Ok((i_after_type, _)) = typer(i_after_colon) {
+            (i_after_type, left)
+        } else {
+            (i, left)
+        }
+    } else {
+        (i, left)
+    };
+    
+    // 继续解析可能的 mutation 操作符
+    let ops_parser = one_of(ops);
+    loop {
+        if let Ok((i_next, op)) = ws(&ops_parser)(i) {
+            if let Ok((i_after, right)) = ternary(i_next) {
+                // 构建 Binary 节点
+                result = Node::Binary(op, Box::new(result), Box::new(right));
+                i = i_after;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    
+    Ok((i, result))
 }
 
 fn ternary<'a>(i: &'a str) -> ParseResult<Node<'a>> {
@@ -610,12 +663,81 @@ fn identifier<'a>(i: &'a str) -> ParseResult<&'a str> {
 }
 
 fn typer<'a>(i: &'a str) -> ParseResult<&'a str> {
-    ws(take_while(|c| 
-        c.is_alphanumeric() || 
-        c == '<' || c == '>' || 
-        c == '|' || c == '_' ||
-        c == '.'
-    ))(i)
+    // 支持泛型、联合类型等
+    let original_ptr = i.as_ptr() as usize;
+    let mut depth = 0;
+    let mut current = i;
+    
+    // JS 关键字列表,遇到这些应该停止
+    let keywords = &["in", "of", "instanceof"];
+    
+    while let Some(ch) = current.chars().next() {
+        match ch {
+            '<' => {
+                depth += 1;
+                current = &current[ch.len_utf8()..];
+            }
+            '>' => {
+                if depth > 0 {
+                    depth -= 1;
+                    current = &current[ch.len_utf8()..];
+                } else {
+                    // 没有匹配的 <,类型结束
+                    break;
+                }
+            }
+            '|' | '&' => {
+                // 联合类型和交叉类型
+                current = &current[ch.len_utf8()..];
+            }
+            '[' | ']' => {
+                // 数组类型,只在泛型内部(depth>0)时才处理
+                if depth > 0 {
+                    current = &current[ch.len_utf8()..];
+                } else {
+                    // depth=0 时遇到 [],类型结束
+                    break;
+                }
+            }
+            '(' | ')' | '{' | '}' | '?' => {
+                // 遇到这些字符,类型结束
+                break;
+            }
+            _ => {
+                if ch.is_alphanumeric() || ch == '_' || ch == '.' {
+                    current = &current[ch.len_utf8()..];
+                } else if ch.is_whitespace() {
+                    // 检查空格后是否还有类型字符
+                    let trimmed = current.trim_start();
+                    // 检查是否是关键字
+                    let is_keyword = keywords.iter().any(|&k| trimmed.starts_with(k));
+                    if trimmed.is_empty() || 
+                       is_keyword ||
+                       trimmed.starts_with(',') || 
+                       trimmed.starts_with(')') || 
+                       trimmed.starts_with('=') ||
+                       trimmed.starts_with('{') || 
+                       trimmed.starts_with(';') ||
+                       trimmed.starts_with('\n') ||
+                       trimmed.starts_with('(') {
+                        break;
+                    }
+                    current = trimmed;
+                } else {
+                    // 其他字符,类型结束
+                    break;
+                }
+            }
+        }
+    }
+    
+    let consumed_len = current.as_ptr() as usize - original_ptr;
+    if consumed_len == 0 {
+        // 没有消耗任何字符,返回错误
+        Err((i, ParserError::TakeWhile))
+    } else {
+        Ok((current, &i[..consumed_len]))
+    }
 }
 
 fn idents<'a>(i: &'a str) -> ParseResult<Node<'a>> {
@@ -676,7 +798,15 @@ fn closure<'a>(i: &'a str) -> ParseResult<Node<'a>> {
 }
 
 fn function<'a>(i: &'a str) -> ParseResult<Node<'a>> {
-    let inner = trio(ws(opt(identifier)), params, boxed(braces));
+    let inner = trio(
+        ws(opt(identifier)), 
+        params, 
+        boxed(right(
+            // 跳过返回值类型注解 :Type
+            opt(pair(ws(tag(":")), typer)),
+            braces
+        ))
+    );
     let func = ws(right(tag("function"), inner));
     map(func, Node::Function)(i)
 }
@@ -717,7 +847,16 @@ fn pattern<'a>(i: &'a str) -> ParseResult<Node<'a>> {
     let param = choice((list_pattern, object_pattern, type_ident));
     let default = right(ws(tag("=")), ws(expression));
     let inner = pair(boxed(param), opt(boxed(default)));
-    ws(map(inner, Node::Param))(i)
+    let (i, result) = ws(map(inner, Node::Param))(i)?;
+    
+    // 跳过类型注解
+    if let Ok((i_after, _)) = ws(tag(":"))(i) {
+        if let Ok((i_final, _)) = typer(i_after) {
+            return Ok((i_final, result));
+        }
+    }
+    
+    Ok((i, result))
 }
 
 fn list_pattern<'a>(i: &'a str) -> ParseResult<Node<'a>> {
@@ -1277,7 +1416,7 @@ where
             map(
                 pair(
                     ws(tag(":")),
-                    ws(ts_type_annotation)
+                    ws(typer)
                 ),
                 |_| ()
             )
@@ -1285,73 +1424,6 @@ where
         
         Ok((i, name))
     }
-}
-
-// TypeScript 类型注解解析器(跳过类型信息)
-fn ts_type_annotation<'a>(i: &'a str) -> ParseResult<&'a str> {
-    let original_ptr = i.as_ptr() as usize;
-    // 递归处理复杂类型,包括泛型、联合类型等
-    let mut depth = 0;
-    let mut current = i;
-    
-    loop {
-        if current.is_empty() {
-            break;
-        }
-        
-        // 检查是否遇到终止符
-        if current.starts_with(',') || current.starts_with(')') || current.starts_with('=') || 
-           current.starts_with('{') || current.starts_with(';') || current.starts_with('\n') {
-            break;
-        }
-        
-        // 处理泛型 <>
-        if current.starts_with('<') {
-            depth += 1;
-            current = &current[1..];
-            continue;
-        }
-        
-        if current.starts_with('>') && depth > 0 {
-            depth -= 1;
-            current = &current[1..];
-            continue;
-        }
-        
-        // 处理联合类型 | 和交叉类型 &
-        if current.starts_with('|') || current.starts_with('&') {
-            current = &current[1..];
-            continue;
-        }
-        
-        // 跳过类型字符
-        if let Some(next) = current.chars().next() {
-            if next.is_alphanumeric() || next == '_' || next == '.' || next == '[' || next == ']' {
-                current = &current[next.len_utf8()..];
-                continue;
-            }
-            // 遇到空格可能是类型结束
-            if next.is_whitespace() {
-                // 检查后面是否跟着类型相关字符
-                let trimmed = current.trim_start();
-                if trimmed.starts_with(':') || trimmed.starts_with(',') || 
-                   trimmed.starts_with(')') || trimmed.starts_with('=') ||
-                   trimmed.starts_with('{') || trimmed.starts_with(';') ||
-                   trimmed.starts_with('\n') || trimmed.is_empty() {
-                    break;
-                }
-                current = trimmed;
-                continue;
-            }
-            // 其他字符,类型结束
-            break;
-        } else {
-            break;
-        }
-    }
-    
-    let consumed_len = current.as_ptr() as usize - original_ptr;
-    Ok((current, &i[..consumed_len]))
 }
 
 fn ws<'a, T>(item: impl Fn(&'a str) -> ParseResult<T>) -> impl Fn(&'a str) -> ParseResult<T> {
