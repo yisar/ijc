@@ -14,7 +14,7 @@ function format(value: string | number): string {
 }
 
 // 可选参数
-function greet(name: string, greeting: string): string {
+function greet(name: string, greeting?: string): string {
   return greeting ? greeting + " " + name : "Hello " + name;
 }
 
@@ -57,9 +57,14 @@ declare global {
 // 交叉类型
 type WithId = { id: string } & { created: Date };
 
+// 泛型函数
+function identity<T>(arg: T): T {
+  return arg;
+}
+
 // 类型断言
 const input = document.getElementById("app");
 const div = input as HTMLDivElement;
 
 // 复杂泛型
-const map = new Map();
+const map: Map<string, Array<number>> = new Map();

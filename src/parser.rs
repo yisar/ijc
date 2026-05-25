@@ -690,12 +690,12 @@ fn typer<'a>(i: &'a str) -> ParseResult<&'a str> {
                 // 联合类型和交叉类型
                 current = &current[ch.len_utf8()..];
             }
-            '[' | ']' => {
-                // 数组类型,只在泛型内部(depth>0)时才处理
+            '[' | ']' | ',' => {
+                // 数组类型和泛型参数分隔符,只在泛型内部(depth>0)时才处理
                 if depth > 0 {
                     current = &current[ch.len_utf8()..];
                 } else {
-                    // depth=0 时遇到 [],类型结束
+                    // depth=0 时遇到这些字符,类型结束
                     break;
                 }
             }
@@ -798,17 +798,53 @@ fn closure<'a>(i: &'a str) -> ParseResult<Node<'a>> {
 }
 
 fn function<'a>(i: &'a str) -> ParseResult<Node<'a>> {
-    let inner = trio(
-        ws(opt(identifier)), 
-        params, 
-        boxed(right(
-            // 跳过返回值类型注解 :Type
-            opt(pair(ws(tag(":")), typer)),
-            braces
-        ))
-    );
-    let func = ws(right(tag("function"), inner));
-    map(func, Node::Function)(i)
+    // 匹配 function 关键字
+    let (i, _) = ws(tag("function"))(i)?;
+    
+    // 解析函数名
+    let (i, name) = ws(opt(identifier))(i)?;
+    
+    // 可选地跳过泛型参数 <T, U>
+    let i = if let Ok((i_after, _)) = ws(tag("<"))(i) {
+        let mut depth = 1;
+        let mut current = i_after;
+        while let Some(ch) = current.chars().next() {
+            match ch {
+                '<' => depth += 1,
+                '>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        current = &current[ch.len_utf8()..];
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            current = &current[ch.len_utf8()..];
+        }
+        current
+    } else {
+        i
+    };
+    
+    // 解析参数
+    let (i, params) = ws(params)(i)?;
+    
+    // 可选地跳过返回值类型 :Type
+    let i = if let Ok((i_after, _)) = ws(tag(":"))(i) {
+        if let Ok((i_type, _)) = typer(i_after) {
+            i_type
+        } else {
+            i
+        }
+    } else {
+        i
+    };
+    
+    // 解析函数体
+    let (i, body) = ws(boxed(braces))(i)?;
+    
+    Ok((i, Node::Function((name, params, body))))
 }
 
 fn generator<'a>(i: &'a str) -> ParseResult<Node<'a>> {
@@ -849,14 +885,21 @@ fn pattern<'a>(i: &'a str) -> ParseResult<Node<'a>> {
     let inner = pair(boxed(param), opt(boxed(default)));
     let (i, result) = ws(map(inner, Node::Param))(i)?;
     
+    // 跳过可选参数标记 ?
+    let (mut i, mut current_result) = if let Ok((i_after, _)) = ws(tag("?"))(i) {
+        (i_after, result)
+    } else {
+        (i, result)
+    };
+    
     // 跳过类型注解
-    if let Ok((i_after, _)) = ws(tag(":"))(i) {
-        if let Ok((i_final, _)) = typer(i_after) {
-            return Ok((i_final, result));
+    if let Ok((i_after_colon, _)) = ws(tag(":"))(i) {
+        if let Ok((i_final, _)) = typer(i_after_colon) {
+            return Ok((i_final, current_result));
         }
     }
     
-    Ok((i, result))
+    Ok((i, current_result))
 }
 
 fn list_pattern<'a>(i: &'a str) -> ParseResult<Node<'a>> {
