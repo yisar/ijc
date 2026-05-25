@@ -63,6 +63,11 @@ pub enum Node<'a> {
     Variable((Option<&'a str>, Box<Node<'a>>)),
 
     JSXElement((Box<Node<'a>>, Vec<Node<'a>>, Vec<Node<'a>>)),
+    JSXFragment(Vec<Node<'a>>),
+    JSXSpreadAttribute(Box<Node<'a>>),
+    JSXMemberExpression((Box<Node<'a>>, Box<Node<'a>>)),
+    JSXNamespacedName((Box<Node<'a>>, Box<Node<'a>>)),
+    JSXText(String),
 }
 
 pub fn block(i: &str) -> ParseResult<Node> {
@@ -90,7 +95,60 @@ fn labeled<'a>(i: &'a str) -> ParseResult<Node<'a>> {
 pub fn statement<'a>(i: &'a str) -> ParseResult<Node<'a>> {
     choice((
         braces, condition, while_loop, do_loop, for_loop, with, gotos, function,
+        ts_type_declaration, // TypeScript 类型声明(跳过)
     ))(i)
+}
+
+// TypeScript 类型声明解析器(直接跳过)
+fn ts_type_declaration<'a>(i: &'a str) -> ParseResult<Node<'a>> {
+    // 匹配 interface, type, enum, namespace, declare
+    let ts_keywords = &["interface", "type", "enum", "namespace", "declare"];
+    
+    for keyword in ts_keywords {
+        if let Ok((remaining, _)) = ws(tag(keyword))(i) {
+            // 跳过整个声明块,找到匹配的 }
+            if let Some(end_pos) = find_ts_declaration_end(remaining) {
+                let after_decl = &remaining[end_pos..];
+                // 返回一个空 Block 节点
+                return Ok((after_decl, Node::Block(vec![])));
+            }
+        }
+    }
+    
+    Err((i, ParserError::Choice))
+}
+
+// 查找 TypeScript 声明的结束位置
+fn find_ts_declaration_end(s: &str) -> Option<usize> {
+    let mut depth = 0;
+    let mut chars = s.char_indices().peekable();
+    
+    while let Some((idx, ch)) = chars.next() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    // 找到匹配的 },返回其后的位置
+                    if let Some((next_idx, _)) = chars.peek() {
+                        return Some(*next_idx);
+                    } else {
+                        return Some(s.len());
+                    }
+                }
+            }
+            ';' => {
+                // declare 语句可能以 ; 结束
+                if depth == 0 {
+                    return Some(idx + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    // 如果没有找到 },返回字符串末尾
+    Some(s.len())
 }
 
 fn gotos<'a>(i: &'a str) -> ParseResult<Node<'a>> {
@@ -251,7 +309,12 @@ fn equality<'a>(i: &'a str) -> ParseResult<Node<'a>> {
 
 fn comparison<'a>(i: &'a str) -> ParseResult<Node<'a>> {
     let ops = &[">=", "<=", ">", "<", "instanceof", "in", "as"];
-    map(infix(bitwise, one_of(ops)), makechain2)(i)
+    map(infix(bitwise, one_of(ops)), |result| {
+        // 过滤掉 as 类型断言
+        let (first, rest) = result;
+        let filtered = rest.into_iter().filter(|(op, _)| op != &"as").collect();
+        makechain2((first, filtered))
+    })(i)
 }
 
 fn bitwise<'a>(i: &'a str) -> ParseResult<Node<'a>> {
@@ -331,8 +394,12 @@ fn action<'a>(i: &'a str) -> ParseResult<Node<'a>> {
 
 fn primitive<'a>(i: &'a str) -> ParseResult<Node<'a>> {
     let double = map(double, Node::Double);
+    let jsx = map(
+        choice((jsx_fragment, jsx_element)),
+        |node| node,
+    );
     ws(choice((
-        jsx_element,
+        jsx,
         quote,
         octal,
         hexa,
@@ -352,33 +419,52 @@ fn primitive<'a>(i: &'a str) -> ParseResult<Node<'a>> {
 }
 
 fn jsx_attribute<'a>(i: &'a str) -> ParseResult<Node<'a>> {
-    map(
+    // 支持展开属性 {...props}
+    let spread = map(
+        middle(ws(tag("{")), right(ws(tag("...")), ws(expression)), ws(tag("}"))),
+        |expr| Node::JSXSpreadAttribute(Box::new(expr)),
+    );
+    
+    // 普通属性 key=value 或 key
+    let normal = map(
         pair(
-            ws(ident),
+            ws(jsx_attribute_name),
             opt(right(
                 ws(tag("=")),
-                ws(choice(
-                    (
-                        quote,
-                        map(middle(ws(tag("{")), ws(expression), ws(tag("}"))), |e| {
-                            Node::Paren(Box::new(e))
-                        }),
-                    ), // 表达式值
-                )),
+                ws(choice((
+                    quote,
+                    map(middle(ws(tag("{")), ws(expression), ws(tag("}"))), |e| {
+                        Node::Paren(Box::new(e))
+                    }),
+                    jsx_element,
+                ))),
             )),
         ),
         |(k, v)| {
             Node::KeyValue((
                 Box::new(k),
-                Box::new(v.unwrap_or_else(|| Node::Ident("true"))),
+                Box::new(v.unwrap_or(Node::Ident("true"))),
             ))
         },
-    )(i)
+    );
+    
+    ws(choice((spread, normal)))(i)
 }
 
-fn jsx_closing_tag<'a>(expected_tag: Node<'a>) -> impl Fn(&'a str) -> ParseResult<()> {
+fn jsx_attribute_name<'a>(i: &'a str) -> ParseResult<Node<'a>> {
+    // 支持命名空间名称 svg:path
+    let namespaced = map(
+        pair(ws(jsx_identifier), right(ws(tag(":")), ws(jsx_identifier))),
+        |(prefix, local)| Node::JSXNamespacedName((Box::new(prefix), Box::new(local))),
+    );
+    
+    ws(choice((namespaced, jsx_identifier)))(i)
+}
+
+fn jsx_closing_tag<'a>(expected_tag: &Node<'a>) -> impl Fn(&'a str) -> ParseResult<()> {
+    let expected_tag = expected_tag.clone();
     move |i| {
-        let (i, actual_tag) = middle(tag("</"), ident, tag(">"))(i)?;
+        let (i, actual_tag) = middle(tag("</"), jsx_tag_name, tag(">"))(i)?;
         if actual_tag == expected_tag {
             Ok((i, ()))
         } else {
@@ -387,46 +473,96 @@ fn jsx_closing_tag<'a>(expected_tag: Node<'a>) -> impl Fn(&'a str) -> ParseResul
     }
 }
 
+fn jsx_tag_name<'a>(i: &'a str) -> ParseResult<Node<'a>> {
+    // 支持命名空间名称 svg:path
+    let namespaced = map(
+        pair(ws(jsx_identifier), right(ws(tag(":")), ws(jsx_identifier))),
+        |(prefix, local)| Node::JSXNamespacedName((Box::new(prefix), Box::new(local))),
+    );
+    
+    // 支持成员访问 React.Fragment
+    fn member_expr<'a>(i: &'a str) -> ParseResult<Node<'a>> {
+        map(
+            pair(ws(jsx_identifier), right(ws(tag(".")), ws(jsx_identifier))),
+            |(obj, prop)| Node::JSXMemberExpression((Box::new(obj), Box::new(prop))),
+        )(i)
+    }
+    
+    // 递归支持多层成员访问
+    let member_chain = map(
+        pair(member_expr, many(right(ws(tag(".")), ws(jsx_identifier)))),
+        |(first, rest)| {
+            rest.into_iter().fold(first, |acc, prop| {
+                Node::JSXMemberExpression((Box::new(acc), Box::new(prop)))
+            })
+        },
+    );
+    
+    ws(choice((namespaced, member_chain, member_expr, jsx_identifier)))(i)
+}
+
+fn jsx_identifier<'a>(i: &'a str) -> ParseResult<Node<'a>> {
+    // JSX 标识符可以包含 - 连字符
+    map(
+        take_while(|c| c.is_alphanumeric() || c == '_' || c == '-'),
+        |s| Node::Ident(s),
+    )(i)
+}
+
 fn jsx_child<'a>(i: &'a str) -> ParseResult<Node<'a>> {
     ws(choice((
+        // JSX 文本节点
         map(take_while(|c| c != '<' && c != '{'), |s| {
-            Node::Str(s.trim().to_string())
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Node::Blank
+            } else {
+                Node::JSXText(trimmed.to_string())
+            }
         }),
-        map(middle(tag("{"), expression, tag("}")), |e| {
+        // JSX 表达式 {...}
+        map(middle(tag("{"), ws(expression), tag("}")), |e| {
             Node::Paren(Box::new(e))
         }),
+        // JSX Fragment <></>
+        jsx_fragment,
+        // JSX 元素
         jsx_element,
     )))(i)
 }
 
+fn jsx_fragment<'a>(i: &'a str) -> ParseResult<Node<'a>> {
+    let (i, _) = pair(tag("<"), tag(">"))(i)?;
+    let (i, children) = many(jsx_child)(i)?;
+    let (i, _) = ws(tag("</>"))(i)?;
+    
+    Ok((i, Node::JSXFragment(children)))
+}
+
 fn jsx_opening_tag<'a>(i: &'a str) -> ParseResult<(Node<'a>, Vec<Node<'a>>, bool)> {
-    map(
-        pair(
-            pair(ws(tag("<")), ws(ident)),
-            pair(
-                many(ws(jsx_attribute)),
-                map(
-                    |i| {
-                        let (i, closing) =
-                            ws(tag("/>"))(i).unwrap_or_else(|_| ws(tag(">"))(i).unwrap());
-                        Ok((i, if closing == "/>" { true } else { false }))
-                    },
-                    |tag_type| tag_type,
-                ),
-            ),
-        ),
-        |((_, tag), (attrs, closing_type))| (tag, attrs, closing_type),
-    )(i)
+    let (i, (_, tag_name)) = pair(ws(tag("<")), ws(jsx_tag_name))(i)?;
+    let (i, attrs) = many(ws(jsx_attribute))(i)?;
+    
+    // 尝试匹配自闭合标签
+    if let Ok((new_i, _)) = ws(tag("/>"))(i) {
+        Ok((new_i, (tag_name, attrs, true)))
+    } else if let Ok((new_i, _)) = ws(tag(">"))(i) {
+        Ok((new_i, (tag_name, attrs, false)))
+    } else {
+        Err((i, ParserError::Tag("Expected > or />".into())))
+    }
 }
 fn jsx_element<'a>(i: &'a str) -> ParseResult<Node<'a>> {
-    let (i, (tag, attrs, closing_type)) = jsx_opening_tag(i)?;
+    let (i, (tag, attrs, is_self_closing)) = jsx_opening_tag(i)?;
 
-    if closing_type {
+    if is_self_closing {
         Ok((i, Node::JSXElement((Box::new(tag), attrs, vec![]))))
     } else {
         let (i, children) = many(jsx_child)(i)?;
-        let (i, _) = jsx_closing_tag(tag.clone())(i)?;
-        Ok((i, Node::JSXElement((Box::new(tag), attrs, children))))
+        // 过滤掉空白的 children
+        let filtered_children: Vec<_> = children.into_iter().filter(|c| !matches!(c, Node::Blank)).collect();
+        let (i, _) = jsx_closing_tag(&tag)(i)?;
+        Ok((i, Node::JSXElement((Box::new(tag), attrs, filtered_children))))
     }
 }
 fn octal<'a>(i: &'a str) -> ParseResult<Node<'a>> {
@@ -477,7 +613,6 @@ fn typer<'a>(i: &'a str) -> ParseResult<&'a str> {
     ws(take_while(|c| 
         c.is_alphanumeric() || 
         c == '<' || c == '>' || 
-        c == '[' || c == ']' ||
         c == '|' || c == '_' ||
         c == '.'
     ))(i)
@@ -588,7 +723,13 @@ fn pattern<'a>(i: &'a str) -> ParseResult<Node<'a>> {
 fn list_pattern<'a>(i: &'a str) -> ParseResult<Node<'a>> {
     let items = chain(tag(","), ws(opt(choice((splat, pattern)))));
     let inner = middle(tag("["), items, ws(tag("]")));
-    ws(map(inner, Node::ListPattern))(i)
+    ws(map(inner, |mut items| {
+        // 空数组模式 [] 应该包含一个 None 元素
+        if items.is_empty() {
+            items.push(None);
+        }
+        Node::ListPattern(items)
+    }))(i)
 }
 
 fn object_pattern<'a>(i: &'a str) -> ParseResult<Node<'a>> {
@@ -795,6 +936,21 @@ where
             b.iter().map(|n| walk(n.clone(), visit)).collect(),
             c.iter().map(|n| walk(n.clone(), visit)).collect(),
         )),
+        Node::JSXFragment(children) => Node::JSXFragment(
+            children.iter().map(|n| walk(n.clone(), visit)).collect(),
+        ),
+        Node::JSXSpreadAttribute(expr) => Node::JSXSpreadAttribute(
+            Box::new(walk(*expr.clone(), visit)),
+        ),
+        Node::JSXMemberExpression((obj, prop)) => Node::JSXMemberExpression((
+            Box::new(walk(*obj.clone(), visit)),
+            Box::new(walk(*prop.clone(), visit)),
+        )),
+        Node::JSXNamespacedName((prefix, local)) => Node::JSXNamespacedName((
+            Box::new(walk(*prefix.clone(), visit)),
+            Box::new(walk(*local.clone(), visit)),
+        )),
+        Node::JSXText(text) => Node::JSXText(text),
         Node::ForTrio(_) => node,
         Node::Blank => node,
         Node::Null => node,
@@ -1116,21 +1272,86 @@ where
         // 捕获名称部分
         let (i, name) = capture(&p)(i)?;
         
-        // 手动实现 "冒号+类型" 部分的解析，不使用 terminated 和 preceded
+        // 跳过类型注解 :type
         let (i, _) = opt(
             map(
                 pair(
-                    // 解析冒号(前面可以有空格)
                     ws(tag(":")),
-                    // 解析类型部分(前面可以有空格)
-                    ws(&p)
+                    ws(ts_type_annotation)
                 ),
-                |_| () // 丢弃解析结果，只关心是否成功
+                |_| ()
             )
         )(i)?;
         
         Ok((i, name))
     }
+}
+
+// TypeScript 类型注解解析器(跳过类型信息)
+fn ts_type_annotation<'a>(i: &'a str) -> ParseResult<&'a str> {
+    let original_ptr = i.as_ptr() as usize;
+    // 递归处理复杂类型,包括泛型、联合类型等
+    let mut depth = 0;
+    let mut current = i;
+    
+    loop {
+        if current.is_empty() {
+            break;
+        }
+        
+        // 检查是否遇到终止符
+        if current.starts_with(',') || current.starts_with(')') || current.starts_with('=') || 
+           current.starts_with('{') || current.starts_with(';') || current.starts_with('\n') {
+            break;
+        }
+        
+        // 处理泛型 <>
+        if current.starts_with('<') {
+            depth += 1;
+            current = &current[1..];
+            continue;
+        }
+        
+        if current.starts_with('>') && depth > 0 {
+            depth -= 1;
+            current = &current[1..];
+            continue;
+        }
+        
+        // 处理联合类型 | 和交叉类型 &
+        if current.starts_with('|') || current.starts_with('&') {
+            current = &current[1..];
+            continue;
+        }
+        
+        // 跳过类型字符
+        if let Some(next) = current.chars().next() {
+            if next.is_alphanumeric() || next == '_' || next == '.' || next == '[' || next == ']' {
+                current = &current[next.len_utf8()..];
+                continue;
+            }
+            // 遇到空格可能是类型结束
+            if next.is_whitespace() {
+                // 检查后面是否跟着类型相关字符
+                let trimmed = current.trim_start();
+                if trimmed.starts_with(':') || trimmed.starts_with(',') || 
+                   trimmed.starts_with(')') || trimmed.starts_with('=') ||
+                   trimmed.starts_with('{') || trimmed.starts_with(';') ||
+                   trimmed.starts_with('\n') || trimmed.is_empty() {
+                    break;
+                }
+                current = trimmed;
+                continue;
+            }
+            // 其他字符,类型结束
+            break;
+        } else {
+            break;
+        }
+    }
+    
+    let consumed_len = current.as_ptr() as usize - original_ptr;
+    Ok((current, &i[..consumed_len]))
 }
 
 fn ws<'a, T>(item: impl Fn(&'a str) -> ParseResult<T>) -> impl Fn(&'a str) -> ParseResult<T> {

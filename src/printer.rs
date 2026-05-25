@@ -110,6 +110,21 @@ impl Printer {
             Node::JSXElement((tag, attrs, children)) => {
                 self.print_jsx_element(tag, attrs, children)
             }
+            Node::JSXFragment(children) => {
+                self.print_jsx_fragment(children)
+            }
+            Node::JSXSpreadAttribute(expr) => {
+                self.print_jsx_spread_attribute(expr)
+            }
+            Node::JSXMemberExpression((obj, prop)) => {
+                self.print_jsx_member_expression(obj, prop)
+            }
+            Node::JSXNamespacedName((prefix, local)) => {
+                self.print_jsx_namespaced_name(prefix, local)
+            }
+            Node::JSXText(text) => {
+                self.print_jsx_text(text)
+            }
             _ => {}
         }
     }
@@ -185,15 +200,86 @@ impl Printer {
             self.write(" />");
         } else {
             self.write(">");
-            for child in children {
-                self.print(child);
+            
+            // 判断是否需要格式化输出
+            let needs_formatting = children.len() > 1 || 
+                children.iter().any(|c| matches!(c, Node::JSXElement(_) | Node::JSXFragment(_)));
+            
+            if needs_formatting {
+                self.indent_inc();
+                for child in children {
+                    self.newline();
+                    self.indent();
+                    self.print(child);
+                }
+                self.indent_dec();
+                self.newline();
+                self.indent();
+            } else {
+                for child in children {
+                    self.print(child);
+                }
             }
+            
             self.write("</");
             self.print(tag);
             self.write(">");
         }
 
         self.in_jsx = prev_in_jsx;
+    }
+
+    fn print_jsx_fragment<'a>(&mut self, children: &[Node<'a>]) {
+        let prev_in_jsx = self.in_jsx;
+        self.in_jsx = true;
+
+        self.write("<>");
+        
+        let needs_formatting = children.len() > 1 || 
+            children.iter().any(|c| matches!(c, Node::JSXElement(_) | Node::JSXFragment(_)));
+        
+        if needs_formatting {
+            self.indent_inc();
+            for child in children {
+                self.newline();
+                self.indent();
+                self.print(child);
+            }
+            self.indent_dec();
+            self.newline();
+            self.indent();
+        } else {
+            for child in children {
+                self.print(child);
+            }
+        }
+        
+        self.write("</>");
+
+        self.in_jsx = prev_in_jsx;
+    }
+
+    fn print_jsx_spread_attribute<'a>(&mut self, expr: &Node<'a>) {
+        self.write("{...");
+        self.print(expr);
+        self.write("}");
+    }
+
+    fn print_jsx_member_expression<'a>(&mut self, obj: &Node<'a>, prop: &Node<'a>) {
+        self.print(obj);
+        self.write(".");
+        self.print(prop);
+    }
+
+    fn print_jsx_namespaced_name<'a>(&mut self, prefix: &Node<'a>, local: &Node<'a>) {
+        self.print(prefix);
+        self.write(":");
+        self.print(local);
+    }
+
+    fn print_jsx_text(&mut self, text: &str) {
+        // JSX 文本直接输出，不需要引号
+        self.write(text);
     }
 
     fn print_key_value<'a>(&mut self, key: &Node<'a>, value: &Node<'a>) {
@@ -209,11 +295,9 @@ impl Printer {
     }
 
     fn print_str(&mut self, s: &str) {
-        if self.in_jsx {
-            self.write(&format!("\"{}\"", s.replace("\"", "\\\"")));
-        } else {
-            self.write(&format!("\"{}\"", s.replace("\"", "\\\"")));
-        }
+        // 在 JSX 上下文中，字符串作为属性值需要引号
+        // 但作为文本节点时不应该有引号（由 print_jsx_text 处理）
+        self.write(&format!("\"{}\"", s.replace("\\", "\\\\").replace("\"", "\\\"")));
     }
 
     fn print_binary<'a>(&mut self, op: &str, left: &Node<'a>, right: &Node<'a>) {
